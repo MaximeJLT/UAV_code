@@ -169,7 +169,7 @@ def main():
     # Adapter le port selon l'OS :
     #   Linux   → "/dev/ttyUSB0"  ou  "/dev/ttyACM0"
     #   Windows → "COM3", "COM5", etc.
-    master = connect_serial(port="/dev/ttyUSB0", baud=57600)
+    master = connect_serial(port="COM5", baud=57600)
     # master = connect_udp()   # ← décommenter pour revenir en SITL/UDP
 
     kill_thread = threading.Thread(target=_kill_switch_listener, args=(master,), daemon=True)
