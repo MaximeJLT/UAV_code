@@ -13,7 +13,7 @@ from arm_pipeline import (
 )
 from goto import send_hold_position, release_rc_override, navigate_to_target_vtol
 from gimbal import set_gimbal_angles_deg
-from connection import send_gcs_heartbeat, connect_udp, check_airspeed_sensor
+from connection import send_gcs_heartbeat, connect_udp, connect_serial, check_airspeed_sensor
 
 METERS_PER_DEG_LAT = 111320.0
 
@@ -165,7 +165,12 @@ def main():
     HOLD_TIME_S  = 30.0
 
     # ---- Setup ----
-    master = connect_udp()
+    # Vol réel via télémétrie série (SiK / RFD900 / etc.)
+    # Adapter le port selon l'OS :
+    #   Linux   → "/dev/ttyUSB0"  ou  "/dev/ttyACM0"
+    #   Windows → "COM3", "COM5", etc.
+    master = connect_serial(port="/dev/ttyUSB0", baud=57600)
+    # master = connect_udp()   # ← décommenter pour revenir en SITL/UDP
 
     kill_thread = threading.Thread(target=_kill_switch_listener, args=(master,), daemon=True)
     kill_thread.start()
