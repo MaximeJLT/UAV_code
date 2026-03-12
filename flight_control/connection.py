@@ -15,18 +15,42 @@ def _set_msg_interval(master, msg_id, hz):
     )
 
 
+def connect_serial(port="/dev/ttyUSB0", baud=57600, heartbeat_timeout=10):
+    """
+    Connexion MAVLink au drone via liaison série (télémétrie radio).
+
+    Paramètres :
+      port : port série du module telemetrie
+             Linux   → "/dev/ttyUSB0"  ou  "/dev/ttyACM0"
+             Windows → "COM3", "COM5", etc.
+      baud : débit en bauds — 57600 est le standard SiK/RFD900
+
+    Détection du bon port Linux :
+      ls /dev/ttyUSB* /dev/ttyACM*
+    """
+    master = mavutil.mavlink_connection(port, baud=baud)
+    master.wait_heartbeat(timeout=heartbeat_timeout)
+    print(f"Heartbeat ok (system={master.target_system}, component={master.target_component})")
+
+    _set_msg_interval(master, 33,  10)   # GLOBAL_POSITION_INT  @ 10 Hz
+    _set_msg_interval(master, 245,  5)   # EXTENDED_SYS_STATE   @  5 Hz
+    _set_msg_interval(master, 74,   5)   # VFR_HUD              @  5 Hz
+    _set_msg_interval(master, 1,    4)   # SYS_STATUS           @  4 Hz
+    _set_msg_interval(master, 30,   2)   # ATTITUDE             @  2 Hz
+
+    time.sleep(0.3)
+    return master
+
+
 def connect_udp(ip="127.0.0.1", port=14551, heartbeat_timeout=10):
     """
-    Connexion MAVLink au drone via UDP.
+    Connexion MAVLink au drone via UDP (SITL / simulation uniquement).
 
     Ports :
       14551 = script Python (dédié, sans MAVProxy entre les deux)
       14550 = MAVProxy / Mission Planner
 
-    En vol réel via radio telemetrie série, remplacer par :
-      mavutil.mavlink_connection("/dev/ttyUSB0", baud=57600)
-    ou en écoute broadcast UDP :
-      mavutil.mavlink_connection("udp:0.0.0.0:14550")
+    Pour un vol réel via radio télémétrie série, utiliser connect_serial().
     """
     master = mavutil.mavlink_connection(f"udp:{ip}:{port}")
     master.wait_heartbeat(timeout=heartbeat_timeout)
@@ -52,7 +76,7 @@ def check_airspeed_sensor(master, timeout=5.0):
 
     msg = master.recv_match(type="SYS_STATUS", blocking=True, timeout=timeout)
     if msg is None:
-        print("⚠️  SYS_STATUS non reçu – vérification capteur vitesse impossible")
+        print("SYS_STATUS non reçu – vérification capteur vitesse impossible")
         return False
 
     present = bool(msg.onboard_control_sensors_present & AIRSPEED_BIT)
@@ -60,10 +84,10 @@ def check_airspeed_sensor(master, timeout=5.0):
     healthy = bool(msg.onboard_control_sensors_health  & AIRSPEED_BIT)
 
     if present and enabled and healthy:
-        print("✅ Capteur pitot : présent, activé, sain")
+        print("Capteur pitot : présent, activé, sain")
         return True
     else:
-        print(f"⚠️  Problème capteur pitot : present={present} enabled={enabled} healthy={healthy}")
+        print(f"Problème capteur pitot : present={present} enabled={enabled} healthy={healthy}")
         print("   → Vérifier ARSPD_TYPE != 0, ARSPD_USE = 1, câblage pitot")
         return False
 
