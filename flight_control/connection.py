@@ -15,19 +15,7 @@ def _set_msg_interval(master, msg_id, hz):
     )
 
 
-def connect_serial(port="/dev/ttyUSB0", baud=57600, heartbeat_timeout=10):
-    """
-    Connexion MAVLink au drone via liaison série (télémétrie radio).
-
-    Paramètres :
-      port : port série du module telemetrie
-             Linux   → "/dev/ttyUSB0"  ou  "/dev/ttyACM0"
-             Windows → "COM3", "COM5", etc.
-      baud : débit en bauds — 57600 est le standard SiK/RFD900
-
-    Détection du bon port Linux :
-      ls /dev/ttyUSB* /dev/ttyACM*
-    """
+def connect_serial(port="COM5", baud=57600, heartbeat_timeout=10):
     master = mavutil.mavlink_connection(port, baud=baud)
     master.wait_heartbeat(timeout=heartbeat_timeout)
     print(f"Heartbeat ok (system={master.target_system}, component={master.target_component})")
