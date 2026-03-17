@@ -11,16 +11,16 @@ from arm_pipeline import (
     set_mode_and_confirm,
     check_arspd_use,
 )
-from goto import send_hold_position, release_rc_override, navigate_to_target_vtol
+from goto import upload_loiter_unlim, navigate_to_target_vtol, release_rc_override
 from gimbal import set_gimbal_angles_deg
-from connection import send_gcs_heartbeat, connect_udp, connect_serial, check_airspeed_sensor
+from connection import send_gcs_heartbeat, connect_udp, check_airspeed_sensor
 
 METERS_PER_DEG_LAT = 111320.0
 
 # -----------------------------------------------------------------------
 # Distance de freinage QuadPlane FW → VTOL
 #
-# A ~18 m/s (vitesse de transition ArduPlane), le freinage en QLOITER
+# A ~18 m/s (vitesse de transition ArduPlane), le freinage en VTOL
 # prend ~100–150 m selon les PIDs et le vent.
 # On déclenche la transition FW→VTOL quand le drone est encore à
 # TRANSITION_TRIGGER_M de la cible, pour qu'il soit à l'arrêt à l'arrivée.
@@ -147,13 +147,13 @@ def wait_landed(master, timeout=240):
 
 
 class State(Enum):
-    SEARCH_FW            = auto()
-    TRACK_DETECTED       = auto()
-    ANTICIPATE_TRANSITION = auto()   # nouveau : attend d'être à TRANSITION_TRIGGER_M
-    TRANSITION_TO_VTOL   = auto()
-    VTOL_HOLD_OVER_TARGET = auto()
-    RETURN_HOME          = auto()
-    FAILSAFE             = auto()
+    SEARCH_FW             = auto()
+    TRACK_DETECTED        = auto()
+    ANTICIPATE_TRANSITION = auto()   # attend d'être à TRANSITION_TRIGGER_M
+    TRANSITION_TO_VTOL    = auto()
+    VTOL_HOLD_OVER_TARGET = auto()   # 100 % AUTO via LOITER_UNLIM
+    RETURN_HOME           = auto()
+    FAILSAFE              = auto()
 
 
 def main():
@@ -169,8 +169,8 @@ def main():
     # Adapter le port selon l'OS :
     #   Linux   → "/dev/ttyUSB0"  ou  "/dev/ttyACM0"
     #   Windows → "COM3", "COM5", etc.
-    master = connect_serial(port="COM5", baud=57600)
-    # master = connect_udp()   # ← décommenter pour revenir en SITL/UDP
+    # master = connect_serial(port="COM5", baud=57600)
+    master = connect_udp()   # ← SITL/UDP
 
     kill_thread = threading.Thread(target=_kill_switch_listener, args=(master,), daemon=True)
     kill_thread.start()
@@ -179,7 +179,6 @@ def main():
     print("\n=== PRÉ-VOL: vérification capteur pitot ===")
     airspeed_ok = check_airspeed_sensor(master, timeout=5.0)
     if airspeed_ok:
-        # Vérifier aussi ARSPD_USE même si le capteur est sain
         check_arspd_use(master)
     else:
         print("⚠️  Capteur pitot non détecté – DO_CHANGE_SPEED sera rejeté")
@@ -193,6 +192,7 @@ def main():
 
     start_time = time.time()
 
+    # Décollage VTOL + transition FW + lancement AUTO sur hypodrome
     pipeline_quadplane_vtol_takeoff_to_auto(master, target_alt=ALT_TARGET_M, airspeed_mps=FW_SEARCH_AIRSPD_MPS)
 
     # scan gimbal
@@ -222,6 +222,8 @@ def main():
 
         # ================================================================
         if state == State.SEARCH_FW:
+            # Drone en AUTO sur le circuit hypodrome — on scanne avec le gimbal
+            # en attendant la détection NN. Le mode AUTO n'est pas touché ici.
 
             set_gimbal_angles_deg(master, pitch_deg=PITCH_DEG, yaw_deg=yaw_offset_deg)
             yaw_offset_deg += direction * 10.0
@@ -235,7 +237,7 @@ def main():
             #     target_latlon = (det_lat, det_lon)
             #     state = State.TRACK_DETECTED
 
-            # Simulation détection après 50s
+            # Simulation détection après 120s
             if time.time() - start_time > 120.0:
                 print("🎯 SIMULATED TARGET DETECTED")
                 target_latlon = (last_lat, last_lon)
@@ -254,13 +256,13 @@ def main():
             d = dist_to_wp_m(tgt_lat, last_lat, last_lon, tgt_lat, tgt_lon)
             print(f"🎯 Target locked at {tgt_lat:.7f}, {tgt_lon:.7f} (d={d:.1f}m)")
             print(f"   Transition will trigger at d <= {TRANSITION_TRIGGER_M}m")
+            # Drone toujours en AUTO — on attend juste d'être assez proche
             state = State.ANTICIPATE_TRANSITION
 
         # ================================================================
         elif state == State.ANTICIPATE_TRANSITION:
-            # On continue à scanner avec le gimbal et on attend que le drone
-            # soit assez proche pour déclencher la transition FW→VTOL.
-            # Le drone continue sa trajectoire AUTO pendant ce temps.
+            # Le drone continue sa trajectoire AUTO pendant qu'on attend
+            # d'être assez proche pour déclencher la transition FW→VTOL.
             tgt_lat, tgt_lon = target_latlon
             d = dist_to_wp_m(tgt_lat, last_lat, last_lon, tgt_lat, tgt_lon)
 
@@ -275,9 +277,9 @@ def main():
 
         # ================================================================
         elif state == State.TRANSITION_TO_VTOL:
+            # Demande la transition FW→VTOL (MAV_CMD_DO_VTOL_TRANSITION).
+            # Le drone est toujours en AUTO pendant la transition.
             transition_fw_to_vtol(master)
-            # Pas de QLOITER ici : navigate_to_target_vtol passe en AUTO
-            # pour la navigation active, puis en QLOITER pour le hold statique.
             state = State.VTOL_HOLD_OVER_TARGET
 
         # ================================================================
@@ -285,12 +287,12 @@ def main():
             tgt_lat, tgt_lon = target_latlon
             last_gcs_hb = time.time()
 
-            print(f"🎯 Navigating to target: lat={tgt_lat:.7f}, lon={tgt_lon:.7f}")
+            print(f"🎯 Navigating to target in AUTO: lat={tgt_lat:.7f}, lon={tgt_lon:.7f}")
 
-            # --- Phase 1 : navigation active vers la cible ---
-            # Utilise AUTO + mini-mission (NAV_WAYPOINT + LOITER_UNLIM).
-            # ArduPlane navigue activement vers la cible au lieu de rester
-            # figé là où le freinage FW→VTOL s'est arrêté.
+            # --- Phase 1 : navigation active vers la cible (AUTO) ---
+            # Upload [ NAV_WAYPOINT cible + LOITER_UNLIM ] → AUTO.
+            # ArduPlane navigue activement vers la cible, puis loitre.
+            # Le drone ne quitte jamais AUTO.
             def _hb():
                 nonlocal last_gcs_hb
                 last_gcs_hb = gcs_keepalive_tick(master, last_gcs_hb, period_s=1.0)
@@ -306,14 +308,22 @@ def main():
             )
 
             if arrived:
-                print(f"✅ On target – switching to QLOITER for stationary hold")
+                print("✅ On target — holding in AUTO/LOITER_UNLIM")
             else:
-                print(f"⚠️  Navigation timeout – holding at current position")
+                print("⚠️  Navigation timeout — uploading LOITER_UNLIM at current position")
+                # Fallback : loitrer à la position actuelle en AUTO
+                upload_loiter_unlim(
+                    master,
+                    lat_deg=last_lat,
+                    lon_deg=last_lon,
+                    alt_rel_m=ALT_TARGET_M,
+                    gcs_keepalive_fn=_hb,
+                )
 
-            set_mode_and_confirm(master, "QLOITER", timeout=15)
-
-            # --- Phase 2 : hold statique au-dessus de la cible ---
-            print(f"⏱  HOLD stationnaire {HOLD_TIME_S:.0f}s...")
+            # --- Phase 2 : hold statique en AUTO/LOITER_UNLIM ---
+            # Le drone loitre en AUTO. On chronomètre HOLD_TIME_S secondes
+            # puis on commande le retour. Aucun changement de mode ici.
+            print(f"⏱  HOLD AUTO/LOITER_UNLIM pendant {HOLD_TIME_S:.0f}s...")
             t0 = time.time()
             while True:
                 last_gcs_hb = gcs_keepalive_tick(master, last_gcs_hb, period_s=1.0)
@@ -322,8 +332,6 @@ def main():
                 if msg is not None:
                     last_lat = msg.lat / 1e7
                     last_lon = msg.lon / 1e7
-
-                send_hold_position(master, tgt_lat, tgt_lon, alt_rel_m=ALT_TARGET_M)
 
                 d = dist_to_wp_m(tgt_lat, last_lat, last_lon, tgt_lat, tgt_lon)
                 elapsed = time.time() - t0
@@ -334,12 +342,11 @@ def main():
 
                 time.sleep(DT)
 
-            release_rc_override(master)
-            time.sleep(0.2)
             state = State.RETURN_HOME
 
         # ================================================================
         elif state == State.RETURN_HOME:
+            # Seul endroit où l'on quitte AUTO : QRTL pour le retour/atterrissage.
             print("RETURN HOME: switching to QRTL (safe VTOL return mode)")
             set_mode_and_confirm(master, "QRTL", timeout=15)
             print("Waiting for landing + disarm...")
