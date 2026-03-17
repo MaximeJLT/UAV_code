@@ -13,46 +13,46 @@ def navigate_to_target_vtol(master, tgt_lat, tgt_lon, alt_rel_m,
     """
     Navigue activement vers une cible GPS en mode VTOL apr�s une transition FW\u2192VTOL.
 
-    Strat�gie : upload d'un mini-plan de mission (HOME + NAV_WAYPOINT cible +
-    NAV_LOITER_UNLIM) puis AUTO. ArduPlane navigue activement vers le waypoint,
-    puis loitre sur place. Quand le drone est dans arrival_radius_m, on repasse
-    en QLOITER pour le hold statique.
+    Strat�gie 100 % AUTO :
+      - Upload d'une micro-mission [ NAV_WAYPOINT cible + NAV_LOITER_UNLIM ]
+      - Passage en AUTO \u2192 ArduPlane navigue activement vers le waypoint,
+        puis loitre sur place ind�finiment (LOITER_UNLIM).
+      - On surveille la distance ; quand le drone est dans arrival_radius_m on
+        retourne True. Le drone reste en AUTO/LOITER_UNLIM \u2014 pas de QLOITER.
 
     Retourne True si arriv�e dans le rayon, False si timeout.
     """
     from arm_pipeline import set_mode_and_confirm
 
     # ------------------------------------------------------------------ #
-    # 1. Uploader une micro-mission : HOME + WP cible + LOITER_UNLIM
+    # 1. Uploader une micro-mission : NAV_WAYPOINT cible + LOITER_UNLIM
     # ------------------------------------------------------------------ #
-    print(f"\U0001f4cd Uploading approach waypoint: lat={tgt_lat:.7f} lon={tgt_lon:.7f} alt={alt_rel_m}m")
+    print(f"\U0001f4cd Uploading approach mission (AUTO): lat={tgt_lat:.7f} lon={tgt_lon:.7f} alt={alt_rel_m}m")
 
     items = [
-        # seq=0 : WP cible
+        # seq=0 : NAV_WAYPOINT vers la cible
         dict(seq=0, frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-            command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-            current=0, autocont=1,
-            p1=0, p2=arrival_radius_m, p3=0, p4=0,
-            lat=tgt_lat, lon=tgt_lon, alt=alt_rel_m),
+             command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+             current=1, autocont=1,
+             p1=0, p2=arrival_radius_m, p3=0, p4=0,
+             lat=tgt_lat, lon=tgt_lon, alt=alt_rel_m),
 
-        # seq=1 : LOITER_UNLIM sur la cible (emp�che "mission complete -> RTL")
+        # seq=1 : LOITER_UNLIM sur la cible
+        #   Emp�che "mission complete \u2192 RTL" et maintient le drone en AUTO
+        #   stationnaire au-dessus de la cible, sans jamais quitter AUTO.
         dict(seq=1, frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-            command=mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM,
-            current=0, autocont=1,
-            p1=0, p2=0, p3=0, p4=0,
-            lat=tgt_lat, lon=tgt_lon, alt=alt_rel_m),
+             command=mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM,
+             current=0, autocont=1,
+             p1=0, p2=0, p3=0, p4=0,
+             lat=tgt_lat, lon=tgt_lon, alt=alt_rel_m),
     ]
 
-    _upload_items(master, items)
+    # Upload avec keepalive pour �viter FS_GCS_ENABL pendant le clear
+    _upload_items(master, items, keepalive_fn=gcs_keepalive_fn)
 
-    # IMPORTANT : d�marre explicitement au WP 0
+    # D�marrer explicitement au WP 0
     master.mav.mission_set_current_send(master.target_system, master.target_component, 0)
     time.sleep(0.2)
-
-    set_mode_and_confirm(master, "AUTO", timeout=15)
-
-    # Upload \u2014 on passe le keepalive pour �viter FS_GCS_ENABL pendant le clear
-    _upload_items(master, items, keepalive_fn=gcs_keepalive_fn)
 
     # ------------------------------------------------------------------ #
     # 2. Passer en AUTO et surveiller la distance
@@ -79,24 +79,45 @@ def navigate_to_target_vtol(master, tgt_lat, tgt_lon, alt_rel_m,
             d = _dist_m(last_lat, last_lon, tgt_lat, tgt_lon)
 
             if time.time() - last_print > 5.0:
-                print(f"   Navigating to target: d={d:.1f}m  ({elapsed:.0f}s / {timeout_s:.0f}s)")
+                print(f"   [AUTO] Navigating to target: d={d:.1f}m  ({elapsed:.0f}s / {timeout_s:.0f}s)")
                 last_print = time.time()
 
             if d <= arrival_radius_m:
-                print(f"\u2705 Target reached (d={d:.1f}m) after {elapsed:.1f}s")
+                print(f"\u2705 Target reached (d={d:.1f}m) after {elapsed:.1f}s \u2014 staying in AUTO/LOITER_UNLIM")
                 return True
 
         if elapsed > timeout_s:
-            print(f"\u26a0\ufe0f  Navigation timeout ({elapsed:.0f}s) \u2013 proceeding with hold at current position")
+            print(f"\u26a0\ufe0f  Navigation timeout ({elapsed:.0f}s) \u2014 proceeding with hold at current position")
             return False
+
+
+def upload_loiter_unlim(master, lat_deg, lon_deg, alt_rel_m=ALT_REL_M,
+                        gcs_keepalive_fn=None):
+    """
+    Upload une mission LOITER_UNLIM sur la position donn�e et passe en AUTO.
+
+    Utilis� pour le hold statique au-dessus de la cible sans jamais quitter AUTO.
+    Le drone continue � loitrer en AUTO jusqu'� ce que la FSM d�cide de rentrer.
+    """
+    from arm_pipeline import set_mode_and_confirm
+
+    items = [
+        dict(seq=0, frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+             command=mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM,
+             current=1, autocont=1,
+             p1=0, p2=0, p3=0, p4=0,
+             lat=lat_deg, lon=lon_deg, alt=alt_rel_m),
+    ]
+    _upload_items(master, items, keepalive_fn=gcs_keepalive_fn)
+    master.mav.mission_set_current_send(master.target_system, master.target_component, 0)
+    time.sleep(0.2)
+    set_mode_and_confirm(master, "AUTO", timeout=15)
 
 
 def send_hold_position(master, lat_deg, lon_deg, alt_rel_m=ALT_REL_M):
     """
     Maintient le drone au-dessus d'une position GPS en QLOITER.
-    Envoie SET_POSITION_TARGET_GLOBAL_INT + RC throttle hold.
-    NOTE : en QLOITER ArduPlane, SET_POSITION_TARGET est partiellement ignor�.
-    Pour un d�placement actif, utiliser navigate_to_target_vtol().
+    Conserv� pour compatibilit� \u2014 la FSM utilise d�sormais upload_loiter_unlim().
     """
     master.mav.set_position_target_global_int_send(
         0,
@@ -201,7 +222,7 @@ def _upload_items(master, items, timeout=15, keepalive_fn=None):
 
         elif mtype == "MISSION_ACK":
             if getattr(msg, "type", -1) == 0:
-                print(f"   \u2705 Approach mission uploaded ({n} items)")
+                print(f"   \u2705 Mission uploaded ({n} items)")
                 return True
             else:
                 print(f"   \u26a0\ufe0f  Mission upload ACK type={msg.type}")
