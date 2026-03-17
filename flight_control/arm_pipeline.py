@@ -30,14 +30,14 @@ def _gcs_keepalive_tick(master, last_hb, period_s=1.0):
 class _RCThrottleKeepAlive:
     """
     Envoie rc_channels_override (throttle 1500) toutes les 100 ms dans un
-    thread de fond, pour maintenir l'altitude en QLOITER pendant les opérations
-    bloquantes (configure_failsafes, mission_upload…).
+    thread de fond, pour maintenir l'altitude en QLOITER pendant les op�rations
+    bloquantes (configure_failsafes, mission_upload\u2026).
 
     Usage :
         with _RCThrottleKeepAlive(master):
             configure_failsafes_for_flight(master)
             upload_mission_from_file(master, "...")
-        # à la sortie du with, l'override est relâché proprement
+        # � la sortie du with, l'override est rel�ch� proprement
     """
     def __init__(self, master, interval_s=0.1):
         self._master   = master
@@ -69,7 +69,7 @@ class _RCThrottleKeepAlive:
         self._stop = True
         if self._thread:
             self._thread.join(timeout=1.0)
-        # Relâcher proprement tous les overrides
+        # Rel�cher proprement tous les overrides
         try:
             self._master.mav.rc_channels_override_send(
                 self._master.target_system,
@@ -173,14 +173,14 @@ def configure_failsafes_for_flight(master):
     _set_param(master, "Q_WP_SPEED",    350, ptype=mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
     _set_param(master, "Q_LOIT_SPEED",  350, ptype=mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
 
-    # --- Vitesse de croisière FW : limiter à 13 m/s max pour protéger la structure ---
-    # Q_TRANSITION_MS : vitesse à laquelle ArduPlane considère la transition FW terminée.
-    #   Défaut ArduPlane = 0 (utilise AIRSPEED_MIN ~10 m/s) mais souvent ~18 m/s en pratique.
-    #   On le force à 12 m/s → la transition FW est déclarée complète à 12 m/s.
-    # AIRSPEED_CRUISE : vitesse de croisière cible en AUTO (cm/s).
+    # --- Vitesse de croisi�re FW : limiter � 13 m/s max pour prot�ger la structure ---
+    # Q_TRANSITION_MS : vitesse � laquelle ArduPlane consid�re la transition FW termin�e.
+    #   D�faut ArduPlane = 0 (utilise AIRSPEED_MIN ~10 m/s) mais souvent ~18 m/s en pratique.
+    #   On le force � 12 m/s \u2192 la transition FW est d�clar�e compl�te � 12 m/s.
+    # AIRSPEED_CRUISE : vitesse de croisi�re cible en AUTO (cm/s).
     #   1300 cm/s = 13 m/s
-    # AIRSPEED_MAX : plafond absolu de la régulation vitesse air.
-    #   15 m/s → ArduPlane ne dépassera pas 15 m/s même avec du vent.
+    # AIRSPEED_MAX : plafond absolu de la r�gulation vitesse air.
+    #   15 m/s \u2192 ArduPlane ne d�passera pas 15 m/s m�me avec du vent.
     print("Setting FW airspeed limits (max 15 m/s for structural safety)...")
     _set_param(master, "AIRSPEED_CRUISE", 13.0, ptype=mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
     _set_param(master, "AIRSPEED_MAX",    15.0, ptype=mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
@@ -321,16 +321,26 @@ def transition_vtol_to_fw(master, timeout=60):
     raise RuntimeError("Transition timeout (still no VTOL_STATE_FW)")
 
 
-def pipeline_quadplane_vtol_takeoff_to_auto(master, target_alt=30.0, vtol_mode="QLOITER", airspeed_mps=14.0):
+def pipeline_quadplane_vtol_takeoff_to_auto(master, target_alt=30.0, airspeed_mps=14.0):
+    """
+    Décollage VTOL + transition FW + lancement AUTO sur hypodrome.
+    100 % AUTO du décollage à la fin — aucun passage en QLOITER, aucun RC override.
+
+    Stratégie :
+      1. Attendre position GPS valide
+      2. Configurer failsafes + vitesses AVANT armement (drone au sol, aucun risque)
+      3. Uploader mission complète = [ HOME + NAV_VTOL_TAKEOFF + hypodrome.waypoints ]
+      4. Passer en AUTO → armer → le drone décolle et enchaîne directement la mission
+      5. Attendre altitude cible, puis transition VTOL→FW en AUTO
+    """
     lat, lon, alt = get_lat_lon_relalt(master, timeout=10)
     print(f"\U0001f4e1 Current position: lat={lat}, lon={lon}, rel_alt={alt} m")
 
     modes = master.mode_mapping()
-    if vtol_mode not in modes:
-        raise RuntimeError(f"{vtol_mode} not available")
     if "AUTO" not in modes:
         raise RuntimeError("AUTO not available")
 
+    # --- Attente position GPS ---
     print("\U0001f7e1 Waiting for position estimate...")
     good = 0
     t0 = time.time()
@@ -346,11 +356,43 @@ def pipeline_quadplane_vtol_takeoff_to_auto(master, target_alt=30.0, vtol_mode="
     if good < 5:
         raise RuntimeError("Position estimate timeout")
 
-    set_mode_and_confirm(master, vtol_mode, timeout=15)
+    # --- Failsafes + vitesses AU SOL (avant armement = pas de risque de chute) ---
+    print("\U0001f7e1 Configuring failsafes and speeds (on ground, before arming)...")
+    configure_failsafes_for_flight(master)
+    time.sleep(0.5)
 
-    print("Dumping some STATUSTEXT that may explain mode refusals...")
+    # --- Upload mission complète : décollage VTOL + hypodrome ---
+    # On uploade TOUT avant d'armer : pas besoin de changer de mode
+    # ou d'envoyer du RC override pendant le vol.
+    cur_lat, cur_lon, _ = get_lat_lon_relalt(master, timeout=5)
+
+    takeoff_prefix = [
+        # seq=0 : HOME (obligatoire, alt=0 absolu)
+        dict(seq=0, frame=mavutil.mavlink.MAV_FRAME_GLOBAL,
+             command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+             current=0, autocont=1,
+             p1=0, p2=0, p3=0, p4=0,
+             lat=cur_lat, lon=cur_lon, alt=0.0),
+        # seq=1 : décollage VTOL vertical jusqu'à target_alt
+        dict(seq=1, frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+             command=mavutil.mavlink.MAV_CMD_NAV_VTOL_TAKEOFF,
+             current=1, autocont=1,
+             p1=0, p2=0, p3=0, p4=float('nan'),
+             lat=cur_lat, lon=cur_lon, alt=float(target_alt)),
+    ]
+
+    print("\U0001f7e1 Uploading full AUTO mission (takeoff + hypodrome)...")
+    from mission_upload import upload_prefixed_mission
+    upload_prefixed_mission(master, takeoff_prefix, "hypodrome.waypoints")
+    print("\u2705 Mission uploaded")
+
+    print("Dumping STATUSTEXT...")
     _drain_statustext(master, n=50)
 
+    # --- Passer en AUTO AVANT d'armer ---
+    set_mode_and_confirm(master, "AUTO", timeout=15)
+
+    # --- Armement ---
     master.arducopter_arm()
     print("\U0001f7e1 Arming requested")
     t0 = time.time()
@@ -362,39 +404,8 @@ def pipeline_quadplane_vtol_takeoff_to_auto(master, target_alt=30.0, vtol_mode="
     else:
         raise RuntimeError("Arming timeout")
 
-    # --- D�collage VTOL vertical via micro-mission NAV_VTOL_TAKEOFF ---
-    #
-    # MAV_CMD_NAV_VTOL_TAKEOFF en command_long \u2192 UNSUPPORTED sur ArduPlane :
-    # cette commande n'est accept�e que depuis un plan de mission, pas en direct.
-    #
-    # Solution : uploader une micro-mission [ HOME + NAV_VTOL_TAKEOFF ] puis AUTO.
-    # ArduPlane monte verticalement en VTOL pur jusqu'� target_alt, reste
-    # stationnaire, puis on reprend la main en QLOITER avant la vraie mission.
-    cur_lat, cur_lon, _ = get_lat_lon_relalt(master, timeout=5)
-
-    takeoff_mission = [
-        # seq=0 : HOME (obligatoire, alt=0 absolu)
-        dict(seq=0, frame=mavutil.mavlink.MAV_FRAME_GLOBAL,
-             command=mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-             current=0, autocont=1,
-             p1=0, p2=0, p3=0, p4=0,
-             lat=cur_lat, lon=cur_lon, alt=0.0),
-        # seq=1 : d�collage VTOL vertical jusqu'� target_alt
-        dict(seq=1, frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-             command=mavutil.mavlink.MAV_CMD_NAV_VTOL_TAKEOFF,
-             current=1, autocont=1,
-             p1=0, p2=0, p3=0, p4=float('nan'),
-             lat=cur_lat, lon=cur_lon, alt=float(target_alt)),
-    ]
-
-    print(f"\U0001f7e1 Uploading VTOL takeoff mission (target alt={target_alt:.1f} m)...")
-    from goto import _upload_items
-    _upload_items(master, takeoff_mission, timeout=15,
-                  keepalive_fn=lambda: _gcs_keepalive_tick(master, 0))
-
-    set_mode_and_confirm(master, "AUTO", timeout=15)
+    # --- Attente altitude cible (le drone décolle seul en AUTO) ---
     print("\U0001f7e1 Waiting VTOL altitude...")
-
     t0 = time.time()
     last_hb = 0.0
     last_log = 0.0
@@ -413,46 +424,9 @@ def pipeline_quadplane_vtol_takeoff_to_auto(master, target_alt=30.0, vtol_mode="
     else:
         raise RuntimeError("VTOL altitude timeout")
 
-
-
-
-    set_mode_and_confirm(master, vtol_mode, timeout=15)
-
-    print("🟡 Stabilising in QLOITER 3s + configuring failsafes + uploading mission...")
-    print("   (RC throttle hold maintained in background thread to prevent altitude loss)")
-
-    # -----------------------------------------------------------------------
-    # CORRECTIF chute libre :
-    # On maintient rc_channels_override throttle=1500 en continu dans un thread
-    # de fond pendant toute la phase bloquante (configure_failsafes + upload).
-    # Sans ça, ArduPlane QLOITER interprète le silence RC comme "throttle relâché"
-    # et descend (voire tombe) pendant les ~10-15s que prennent ces opérations.
-    # Le context manager relâche proprement l'override à sa sortie.
-    # -----------------------------------------------------------------------
-    with _RCThrottleKeepAlive(master, interval_s=0.1):
-        time.sleep(3.0)  # stabilisation QLOITER
-
-        configure_failsafes_for_flight(master)
-        time.sleep(0.5)
-
-        print("Uploading mission after TAKEOFF (required for QuadPlane AUTO)...")
-        from mission_upload import upload_mission_from_file
-        upload_mission_from_file(master, "hypodrome.waypoints")
-        print("Mission uploaded")
-
-    # RC override relâché proprement par __exit__ du context manager
-    time.sleep(0.3)
-
-    set_mode_and_confirm(master, "AUTO", timeout=20)
-
-    master.mav.mission_set_current_send(master.target_system, master.target_component, 1)
+    # --- Transition VTOL→FW en AUTO ---
+    request_airspeed(master, min(airspeed_mps, 13.0))
     time.sleep(1.0)
-
-    set_mode_and_confirm(master, "AUTO", timeout=20)
-
-    request_airspeed(master, min(airspeed_mps, 13.0))  # plafond structurel 13 m/s
-    time.sleep(1.0)
-
     transition_vtol_to_fw(master, timeout=90)
 
     print("\u2705 Pipeline OK: AUTO running + FW state confirmed")
@@ -477,11 +451,11 @@ def transition_fw_to_vtol(master, timeout=60):
 #Kill switch
 def emergency_kill(master):
     """
-    Kill switch réglementaire : désarmement forcé en vol.
+    Kill switch r�glementaire : d�sarmement forc� en vol.
     Envoie MAV_CMD_COMPONENT_ARM_DISARM avec force flag = 21196.
-    Le magic number 21196 est le code ArduPilot pour forcer le désarmement en vol.
+    Le magic number 21196 est le code ArduPilot pour forcer le d�sarmement en vol.
     """
-    print("🚨 KILL SWITCH ACTIVATED – FORCE DISARM")
+    print("\U0001f6a8 KILL SWITCH ACTIVATED \u2013 FORCE DISARM")
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
